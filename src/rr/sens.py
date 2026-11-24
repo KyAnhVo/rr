@@ -76,6 +76,14 @@ class SensReader:
         pose = self._entries[index].pose
         return pose if np.isfinite(pose).all() else None
 
+    def color_pose(self, index: int) -> NDArray[np.float64] | None:
+        pose = self.pose(index)
+        return None if pose is None else pose @ np.linalg.inv(self.color_extrinsics)
+
+    def depth_pose(self, index: int) -> NDArray[np.float64] | None:
+        pose = self.pose(index)
+        return None if pose is None else pose @ np.linalg.inv(self.depth_extrinsics)
+
     def color(self, index: int) -> MatLike:
         """BGR image."""
         e = self._entries[index]

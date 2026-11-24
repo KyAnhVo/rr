@@ -15,14 +15,13 @@ Torch (stage 4) conflicts with pycolmap over CUDA versions, so it uses a second 
 
     UV_PROJECT_ENVIRONMENT=.venv-seg uv sync --no-group colmap --group segmentation
 
-## ScanNet
+## Benchmark
 
-Request access at http://www.scan-net.org/, save the script they send you as
-`room-data/download-scannet.py`, then:
-
-    scripts/download_scannet.sh scene0000_00 [more scenes]
+    scripts/download_replica.py room0 office0   # non-commercial research/education terms
     uv run pytest                    # unit tests + every downloaded scene
-    uv run pytest -m "not scannet"   # unit tests only
-    uv run rr-scannet                # same scenes, without pytest
+    uv run pytest -m "not scenes"    # unit tests only
+    uv run rr-benchmark              # same scenes, without pytest
 
-Metrics and pictures go to `results/<time>/<scene>/<mode>/`.
+Metrics and pictures go to `results/<time>/<scene>/<mode>/`. ScanNet also works: request access
+at http://www.scan-net.org/, save their script as `room-data/download-scannet.py`, and run
+`scripts/download_scannet.sh scene0000_00`.

@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from cv2.typing import MatLike
 from numpy.typing import NDArray
+from scipy.spatial import cKDTree
 
 from rr.evaluation import Similarity
 from rr.ply import PointCloud
@@ -102,26 +103,38 @@ def gravity_frame(model) -> Similarity:
     return Similarity(1.0, np.stack([x, np.cross(up, x), up]), np.zeros(3))
 
 
-def outside_views(cloud: PointCloud, output: Path, title: str, radius: int, size: tuple[int, int] = (960, 720)) -> None:
-    """Top view plus four corners. `cloud` must be z-up."""
-    lo, hi = np.percentile(cloud.points, [1, 99], axis=0)
+def facing_cameras(cloud: PointCloud, model) -> PointCloud:
+    """Sparse points have no normals: point them at the cameras, so near walls can be culled."""
+    centers = np.array([i.projection_center() for i in model.images.values()])
+    nearest = centers[cKDTree(centers).query(cloud.points)[1]]
+    n = nearest - cloud.points
+    return PointCloud(cloud.points, n / np.linalg.norm(n, axis=1, keepdims=True), cloud.colors)
+
+
+def outside_views(clouds: dict[str, tuple[PointCloud, int]], output: Path, size: tuple[int, int] = (720, 540)) -> None:
+    """Top view plus four corners, one row per view and one column per cloud.
+
+    Clouds are z-up, and all are drawn from the same cameras, framed on the first one.
+    """
+    reference = next(iter(clouds.values()))[0].points
+    lo, hi = np.percentile(reference, [1, 99], axis=0)
     center, extent = (lo + hi) / 2, float(np.linalg.norm(hi - lo))
     margin = 0.15 * (hi - lo)
-    cloud = cloud[np.all((cloud.points > lo - margin) & (cloud.points < hi + margin), axis=1)]
-    cull = bool(np.any(cloud.normals))
     K = np.array([[size[1] * 1.2, 0, size[0] / 2], [0, size[1] * 1.2, size[1] / 2], [0, 0, 1]])
-    cells = []
-    views = [("top", 0, 89.0)] + [(f"corner_{a}", a, 35.0) for a in (45, 135, 225, 315)]
-    for name, azimuth, elevation in views:
-        shown = cloud
-        if not cull and name == "top":  # without normals, the ceiling must be cut away
-            shown = cloud[cloud.points[:, 2] < lo[2] + 0.85 * (hi[2] - lo[2])]
+    rows = []
+    for name, azimuth, elevation in [("top", 0, 89.0)] + [(f"corner_{a}", a, 35.0) for a in (45, 135, 225, 315)]:
         a, e = np.radians(azimuth), np.radians(elevation)
         eye = center + 1.25 * extent * np.array([np.cos(a) * np.cos(e), np.sin(a) * np.cos(e), np.sin(e)])
-        image = render(shown, K, _look_at(eye, center, np.array([0, 0, 1.0])), size, radius, cull)
-        _save(output / f"{name}.png", image)
-        cells.append(_label(image, f"{title}: {name}"))
-    _save(output / "sheet.png", _grid(cells, 3))
+        cells = []
+        for label, (cloud, radius) in clouds.items():
+            inside = np.all((cloud.points > lo - margin) & (cloud.points < hi + margin), axis=1)
+            pose = _look_at(eye, center, np.array([0, 0, 1.0]))
+            image = render(cloud[inside], K, pose, size, radius, bool(np.any(cloud.normals)))
+            _save(output / f"{name}_{label.replace(' ', '_')}.png", image)
+            cells.append(_label(image, f"{label}: {name}"))
+        rows.append(np.hstack(cells))
+        _save(output / f"{name}.png", rows[-1])
+    _save(output / "sheet.png", np.vstack(rows))
 
 
 def frame_comparisons(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="rr", description="Room reconstruction, stages 1-3")
-    parser.add_argument("video", type=Path, help="video or ScanNet .sens file")
+    parser.add_argument("video", type=Path, help="video, Replica scene directory or ScanNet .sens file")
     parser.add_argument("output", type=Path, help="fresh output directory")
     parser.add_argument("--through", type=int, choices=(1, 2, 3), default=3, help="last stage to run")
     parser.add_argument("--matcher", choices=("sequential", "exhaustive"), default="sequential",

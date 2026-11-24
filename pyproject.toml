@@ -16,7 +16,7 @@ dependencies = [
 
 [project.scripts]
 rr = "rr:main"
-rr-scannet = "rr.benchmark:main"
+rr-benchmark = "rr.benchmark:main"
 
 [tool.pyright]
 include = ["src", "tests"]
@@ -53,4 +53,4 @@ default-groups = ["dev", "colmap"]
 conflicts = [[{ group = "colmap" }, { group = "segmentation" }]]
 
 [tool.pytest.ini_options]
-markers = ["scannet: end-to-end on every scene under room-data (slow, needs a GPU)"]
+markers = ["scenes: end-to-end on every scene under room-data (slow, needs a GPU)"]

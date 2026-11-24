@@ -1,4 +1,4 @@
-"""Scores a reconstruction against ScanNet ground truth (meters)."""
+"""Scores a reconstruction against dataset ground truth (meters)."""
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,7 +8,7 @@ from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
 from rr.ply import PointCloud
-from rr.sens import SensReader
+from rr.sources import Recording
 
 Array = NDArray[np.float64]
 
@@ -21,6 +21,9 @@ class Similarity:
 
     def apply(self, points: Array) -> Array:
         return self.scale * points @ self.R.T + self.t
+
+    def inverse(self) -> "Similarity":
+        return Similarity(1 / self.scale, self.R.T, -self.R.T @ self.t / self.scale)
 
     def cloud(self, c: PointCloud) -> PointCloud:
         return PointCloud(self.apply(c.points), c.normals @ self.R.T, c.colors)
@@ -39,13 +42,13 @@ def umeyama(src: Array, dst: Array) -> Similarity:
     return Similarity(scale, R, md - scale * R @ ms)
 
 
-def align_cameras(model: Any, frame_of: dict[str, int], sens: SensReader) -> tuple[Similarity, dict[str, float]]:
+def align_cameras(model: Any, frame_of: dict[str, int], recording: Recording) -> tuple[Similarity, dict[str, float]]:
     src, dst = [], []
     for image in model.images.values():
-        pose = sens.pose(frame_of[image.name])
+        pose = recording.color_pose(frame_of[image.name])
         if pose is not None:
             src.append(image.projection_center())
-            dst.append((pose @ np.linalg.inv(sens.color_extrinsics))[:3, 3])
+            dst.append(pose[:3, 3])
     a, b = np.array(src).reshape(-1, 3), np.array(dst).reshape(-1, 3)
     sim = umeyama(a, b)
     err = np.linalg.norm(sim.apply(a) - b, axis=1)
@@ -55,7 +58,7 @@ def align_cameras(model: Any, frame_of: dict[str, int], sens: SensReader) -> tup
 
 
 def read_mesh(path: Path) -> tuple[Array, NDArray[np.int64], NDArray[np.uint8]]:
-    """Vertices, triangles and vertex colours of a binary ScanNet mesh."""
+    """Vertices, triangles and vertex colours of a binary triangle or quad mesh."""
     types = {"float": "<f4", "float32": "<f4", "double": "<f8", "uchar": "u1", "uint8": "u1",
              "ushort": "<u2", "uint16": "<u2", "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4"}
     with path.open("rb") as f:
@@ -79,12 +82,18 @@ def read_mesh(path: Path) -> tuple[Array, NDArray[np.int64], NDArray[np.uint8]]:
             raise ValueError(f"{path}: unsupported mesh layout")
         v = np.fromfile(f, np.dtype(fields), counts["vertex"])
         _, n_type, i_type = face[0].split()
-        tri = np.fromfile(f, np.dtype([("n", types[n_type]), ("i", types[i_type], 3)]), counts["face"])
-    if len(tri) != counts["face"] or np.any(tri["n"] != 3):
-        raise ValueError(f"{path}: not a triangle mesh")
+        start = f.tell()
+        corners = int(np.fromfile(f, types[n_type], 1)[0])
+        f.seek(start)
+        faces = np.fromfile(f, np.dtype([("n", types[n_type]), ("i", types[i_type], corners)]), counts["face"])
+    if corners not in (3, 4) or len(faces) != counts["face"] or np.any(faces["n"] != corners):
+        raise ValueError(f"{path}: not a pure triangle or quad mesh")
+    index = faces["i"].astype(np.int64)
+    if corners == 4:
+        index = np.concatenate([index[:, [0, 1, 2]], index[:, [0, 2, 3]]])
     xyz = np.column_stack([v[k] for k in "xyz"]).astype(np.float64)
     rgb = np.column_stack([v[k] for k in ("red", "green", "blue")]).astype(np.uint8)
-    return xyz, tri["i"].astype(np.int64), rgb
+    return xyz, index, rgb
 
 
 def sample_mesh(path: Path, count: int = 2_000_000, seed: int = 0) -> PointCloud:
@@ -101,24 +110,23 @@ def sample_mesh(path: Path, count: int = 2_000_000, seed: int = 0) -> PointCloud
     return PointCloud(points, cross[pick] / area[pick, None], rgb[f[pick, 0]])
 
 
-def visible_mask(points: Array, sens: SensReader, frames: list[int], tolerance: float = 0.05) -> NDArray[np.bool_]:
+def visible_mask(points: Array, recording: Recording, frames: list[int], tolerance: float = 0.05) -> NDArray[np.bool_]:
     """Mesh points measured by the depth sensor in at least one of the given frames."""
     seen = np.zeros(len(points), dtype=bool)
-    K = sens.depth_intrinsics[:3, :3]
-    w, h = sens.depth_size
+    K = recording.depth_intrinsics[:3, :3]
+    w, h = recording.depth_size
     for i in frames:
-        pose = sens.pose(i)
+        pose = recording.depth_pose(i)
         if pose is None:
             continue
-        # Same convention as ScanNet's tools: pose is the camera's, extrinsic maps sensor to camera.
-        cam_from_world = np.linalg.inv(pose @ np.linalg.inv(sens.depth_extrinsics))
+        cam_from_world = np.linalg.inv(pose)
         cam = points @ cam_from_world[:3, :3].T + cam_from_world[:3, 3]
         idx = np.flatnonzero(cam[:, 2] > 0.1)
         uv = cam[idx] @ K.T
         xy = np.round(uv[:, :2] / uv[:, 2:])
         ok = (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
         idx, xy = idx[ok], xy[ok].astype(int)
-        z = sens.depth(i)[xy[:, 1], xy[:, 0]]
+        z = recording.depth(i)[xy[:, 1], xy[:, 0]]
         seen[idx[(z > 0) & (np.abs(z - cam[idx, 2]) < tolerance)]] = True
     return seen
 
