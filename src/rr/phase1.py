@@ -17,6 +17,8 @@ from cv2.typing import MatLike
 from numpy.typing import NDArray
 from scipy.ndimage import median_filter
 
+from rr.sources import FrameSource
+
 Reason = Literal["first", "parallax", "overlap", "bridge", "break"]
 
 
@@ -111,12 +113,14 @@ def pair_geometry(
 
 
 class KeyframeSelector:
-    def __init__(self, config: KeyframeConfig | None = None) -> None:
+    def __init__(self, config: KeyframeConfig | None = None, intrinsics: NDArray[np.float64] | None = None) -> None:
+        """`intrinsics` is the 3x3 matrix at the source's resolution, if known."""
         self.config = config or KeyframeConfig()
+        self._intrinsics = intrinsics
         self._sift = cv2.SIFT.create(nfeatures=self.config.max_features)
         self._matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
-    def select(self, video_path: Path, output_dir: Path) -> list[Keyframe]:
+    def select(self, source: FrameSource, output_dir: Path) -> list[Keyframe]:
         """Write keyframes to output_dir/images and metadata to output_dir/keyframes.json."""
         cfg = self.config
         image_dir = output_dir / "images"
@@ -124,17 +128,17 @@ class KeyframeSelector:
         if any(image_dir.iterdir()):
             raise FileExistsError(f"{image_dir} is not empty; use a fresh output directory")
 
-        step = self._step(video_path)
+        step = self._step(source)
         # Two passes: the blur test needs the sharpness of *future* frames too.
-        scores = {i: sharpness(f) for i, f in self._frames(video_path, step)}
+        scores = {i: sharpness(f) for i, f in source.frames(step)}
         if not scores:
-            raise ValueError(f"no frames could be read from {video_path}")
+            raise ValueError(f"no frames could be read from {source.path}")
         half_window = max(1, round(cfg.blur_window_s * cfg.process_fps))
         mask = sharp_mask(np.array(list(scores.values())), half_window, cfg.blur_ratio)
         sharp = {i for i, ok in zip(scores, mask) if ok}
 
         keyframes: list[Keyframe] = []
-        for frame, reason, geom in self._choose(video_path, step, sharp, scores):
+        for frame, reason, geom in self._choose(source, step, sharp, scores):
             name = f"{len(keyframes):05d}.jpg"
             ok = cv2.imwrite(
                 str(image_dir / name),
@@ -146,7 +150,7 @@ class KeyframeSelector:
             keyframes.append(Keyframe(name, frame.index, reason, frame.sharpness, geom.inliers, geom.parallax_deg))
 
         (output_dir / "keyframes.json").write_text(json.dumps({
-            "video": str(video_path),
+            "video": str(source.path),
             "config": asdict(cfg),
             "frames_examined": len(scores),
             "frames_blurry": len(scores) - len(sharp),
@@ -155,14 +159,14 @@ class KeyframeSelector:
         return keyframes
 
     def _choose(
-        self, video_path: Path, step: int, sharp: set[int], scores: dict[int, float]
+        self, source: FrameSource, step: int, sharp: set[int], scores: dict[int, float]
     ) -> Iterator[tuple[FrameData, Reason, PairGeometry]]:
         cfg = self.config
         reference: FrameData | None = None
         candidate: tuple[FrameData, PairGeometry] | None = None  # last frame still well tracked
         best_inliers = 0
 
-        for index, image in self._frames(video_path, step):
+        for index, image in source.frames(step):
             if index not in sharp:
                 continue
             frame = self._extract(index, image, scores[index])
@@ -199,29 +203,8 @@ class KeyframeSelector:
                 yield frame, reason, geom
                 reference, candidate, best_inliers = frame, None, 0
 
-    def _step(self, video_path: Path) -> int:
-        video = cv2.VideoCapture(str(video_path))
-        try:
-            if not video.isOpened():
-                raise FileNotFoundError(f"cannot open video {video_path}")
-            fps = video.get(cv2.CAP_PROP_FPS)
-        finally:
-            video.release()
-        return max(1, round(fps / self.config.process_fps)) if fps > 0 else 1
-
-    @staticmethod
-    def _frames(video_path: Path, step: int) -> Iterator[tuple[int, MatLike]]:
-        video = cv2.VideoCapture(str(video_path))
-        try:
-            index = 0
-            while video.grab():
-                if index % step == 0:
-                    ok, image = video.retrieve()
-                    if ok:
-                        yield index, image
-                index += 1
-        finally:
-            video.release()
+    def _step(self, source: FrameSource) -> int:
+        return max(1, round(source.fps / self.config.process_fps)) if source.fps > 0 else 1
 
     def _extract(self, index: int, image: MatLike, score: float) -> FrameData:
         gray = cv2.cvtColor(_resize_long_side(image, self.config.track_size), cv2.COLOR_BGR2GRAY)
@@ -238,6 +221,11 @@ class KeyframeSelector:
         pts_1 = np.array([a.keypoints[m.queryIdx].pt for m in matches], dtype=np.float64)
         pts_2 = np.array([b.keypoints[m.trainIdx].pt for m in matches], dtype=np.float64)
         h, w = _resize_long_side(a.image, self.config.track_size).shape[:2]
-        f = self.config.focal_factor * max(h, w)
-        K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
+        if self._intrinsics is None:
+            f = self.config.focal_factor * max(h, w)
+            K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
+        else:
+            K = self._intrinsics.copy()
+            K[0] *= w / a.image.shape[1]
+            K[1] *= h / a.image.shape[0]
         return pair_geometry(pts_1, pts_2, K, self.config.ransac_px)

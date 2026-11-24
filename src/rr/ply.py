@@ -58,7 +58,8 @@ def read_ply(path: Path) -> PointCloud:
         data = np.fromfile(f, dtype=np.dtype(fields), count=count)
     stack = lambda names, t: np.column_stack([data[n] for n in names]).astype(t)
     return PointCloud(
-        stack("xyz", np.float64), stack(("nx", "ny", "nz"), np.float64),
+        stack("xyz", np.float64),
+        stack(("nx", "ny", "nz"), np.float64) if "nx" in data.dtype.names else np.zeros((len(data), 3)),
         stack(("red", "green", "blue"), np.uint8),
     )
 

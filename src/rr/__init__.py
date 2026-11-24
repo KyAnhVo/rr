@@ -4,7 +4,7 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="rr", description="Room reconstruction, stages 1-3")
-    parser.add_argument("video", type=Path)
+    parser.add_argument("video", type=Path, help="video or ScanNet .sens file")
     parser.add_argument("output", type=Path, help="fresh output directory")
     parser.add_argument("--through", type=int, choices=(1, 2, 3), default=3, help="last stage to run")
     parser.add_argument("--matcher", choices=("sequential", "exhaustive"), default="sequential",
@@ -16,12 +16,13 @@ def main() -> None:
 
     from rr.phase1 import KeyframeConfig, KeyframeSelector
     from rr.phase2 import SparseConfig, reconstruct_sparse
+    from rr.sources import open_source
     from rr.phase3 import DenseConfig, reconstruct_dense
 
     out: Path = args.output
     keyframes = KeyframeSelector(
         KeyframeConfig(focal_factor=args.focal_factor, min_parallax_deg=args.min_parallax)
-    ).select(args.video, out)
+    ).select(open_source(args.video), out)
     print(f"stage 1: {len(keyframes)} keyframes")
     if args.through == 1:
         return
