@@ -1,191 +1,243 @@
-from cv2.typing import MatLike
+"""Stage 1: keyframe selection.
+
+A frame becomes a keyframe when it is sharp relative to its neighbours and has
+enough *rotation-compensated* parallax w.r.t. the previous keyframe. We avoid a
+homography/fundamental score ratio here: a homography explains pure rotation, but
+also a translating camera looking at a single wall, which we want to keep.
+"""
+import json
+from collections.abc import Iterator, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
+
 import cv2
 import numpy as np
-from typing import Literal, Sequence
-from dataclasses import dataclass
+from cv2.typing import MatLike
+from numpy.typing import NDArray
+from scipy.ndimage import median_filter
 
-from numpy._typing import NDArray
+Reason = Literal["first", "parallax", "overlap", "bridge", "break"]
+
 
 @dataclass
-class PointCloud:
-    cam_pos_lst: np.ndarray[tuple[int, Literal[3]], np.dtype[np.float64]]
+class KeyframeConfig:
+    process_fps: float = 10.0        # frames examined per second of video
+    track_size: int = 1280           # long side used for SIFT tracking
+    save_size: int = 1920            # long side of the saved keyframes
+    blur_ratio: float = 0.6          # sharpness floor, relative to the local median
+    blur_window_s: float = 1.0       # half width of that local window
+    ratio_test: float = 0.75         # Lowe's ratio test
+    max_features: int = 3000
+    min_matches: int = 40            # fewer epipolar inliers than this = tracking lost
+    min_parallax_deg: float = 1.5    # median parallax after removing rotation
+    min_overlap: float = 0.35        # inliers relative to the keyframe's best match count
+    focal_factor: float = 0.8        # focal guess = factor * long side (phones ~0.7-0.8)
+    ransac_px: float = 1.5
+
 
 @dataclass
 class FrameData:
-    frame: MatLike
+    index: int
+    image: MatLike
+    sharpness: float
     keypoints: Sequence[cv2.KeyPoint]
-    descriptors: MatLike
+    descriptors: MatLike | None
 
-class PointCloudEstimator:
-    # Constants
-    BF_MATCH_THRESHOLD: float = 0.7
 
-    # Data structures 
-    frame_data_lst: list[FrameData]
+@dataclass
+class PairGeometry:
+    inliers: int
+    parallax_deg: float
 
-    def __init__(self) -> None:
-        self.frame_data_lst = []
 
-    def generate_positions(self, video: cv2.VideoCapture) -> PointCloud:
-        self.filter_frames(video)
+@dataclass
+class Keyframe:
+    name: str
+    frame_index: int
+    reason: Reason
+    sharpness: float
+    inliers: int
+    parallax_deg: float
 
-        # TODO: continue the skeleton
-        raise NotImplementedError("not finish")
 
-    def filter_frames(self, video: cv2.VideoCapture) -> list[FrameData]:
-        self.frame_data_lst = []
+def _resize_long_side(image: MatLike, size: int) -> MatLike:
+    scale = size / max(image.shape[:2])
+    if scale >= 1:
+        return image
+    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-        sift = cv2.SIFT.create()
-        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
-        # First frame
-        _, first_frame = video.read()
-        first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-        first_frame_keypoints, first_frame_descriptors = sift.detectAndCompute(
-            first_frame, None)
+def sharpness(image: MatLike) -> float:
+    """Variance of the Laplacian at a fixed resolution."""
+    gray = cv2.cvtColor(_resize_long_side(image, 640), cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-        # Package first frame to data class
-        latest_keyframe_data: FrameData = FrameData(
-            first_frame, 
-            first_frame_keypoints, 
-            first_frame_descriptors)
-        self.frame_data_lst.append(latest_keyframe_data)
 
-        while video.isOpened():
-            ret, frame = video.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            keypoints, descriptors = sift.detectAndCompute(frame, None)
-            current_frame_data: FrameData = FrameData(frame, keypoints, descriptors)
+def sharp_mask(scores: NDArray[np.float64], half_window: int, ratio: float) -> NDArray[np.bool_]:
+    """Compare against a local median: plain walls score low even in perfect focus."""
+    if len(scores) == 0:
+        return np.zeros(0, dtype=bool)
+    return scores >= ratio * median_filter(scores, size=2 * half_window + 1, mode="nearest")
 
-            # Here, we match the descriptors, and apply Lowe's ratio test. 
-            # Throw away frames with minimal matches.
-            matches = bf.knnMatch(latest_keyframe_data.descriptors, descriptors, k=2)
-            good_matches = [
-                pair[0] for pair in matches 
-                if len(pair) == 2 and 
-                pair[0].distance < self.BF_MATCH_THRESHOLD * pair[1].distance]
 
-            if self.keyframe_check(
-                latest_keyframe_data, 
-                current_frame_data, 
-                good_matches
-            ):
-                self.frame_data_lst.append(current_frame_data)
-                latest_keyframe_data = current_frame_data
+def pair_geometry(
+    pts_1: NDArray[np.float64], pts_2: NDArray[np.float64], K: NDArray[np.float64], ransac_px: float
+) -> PairGeometry:
+    """Epipolar inliers, and the parallax that remains once rotation is undone."""
+    if len(pts_1) < 8:
+        return PairGeometry(0, 0.0)
+    E, mask = cv2.findEssentialMat(pts_1, pts_2, K, method=cv2.USAC_MAGSAC, prob=0.999, threshold=ransac_px)
+    if E is None or E.shape != (3, 3) or mask is None:
+        return PairGeometry(0, 0.0)
+    keep = mask.ravel().astype(bool)
+    if keep.sum() < 8:
+        return PairGeometry(int(keep.sum()), 0.0)
 
-        return self.frame_data_lst
+    K_inv = np.linalg.inv(K)
 
-    def keyframe_check(
-            self, 
-            latest_keyframe: FrameData, 
-            current_frame: FrameData, 
-            good_matches: list[cv2.DMatch]
-    ) -> bool:
-        # Constants
-        RANSAC_REPROJ_HOMOGRAPHY = 5.0
-        RANSAC_REPROJ_FUNDAMENTAL = 3.0
-        SYMMETRIC_TRANSFER_SCORE_THRESHOLD = 5.99 # chi-sq 2 DoF 95% confidence
-        SYMMETRIC_EPIPOLAR_SCORE_THRESHOLD = 3.84 # chi-sq 1 DoF 95% confidence
-        ACCEPTANCE_RATIO = 0.45 # From ORB-SLAM original formulation
-        GOOD_MATCHES_MIN_SIZE = 30 # Too few stuffs => there is essentially nothing to match.
+    def rays(pts: NDArray[np.float64]) -> NDArray[np.float64]:
+        r = np.column_stack([pts, np.ones(len(pts))]) @ K_inv.T
+        return r / np.linalg.norm(r, axis=1, keepdims=True)
 
-        if len(good_matches) < GOOD_MATCHES_MIN_SIZE:
-            return False
+    r1, r2 = rays(pts_1[keep]), rays(pts_2[keep])
+    # Of the two rotations in E, take the one leaving the least parallax. Unlike a
+    # cheirality vote, this stays well defined when translation is ~0.
+    parallax = np.inf
+    for R in cv2.decomposeEssentialMat(E)[:2]:
+        cos = np.clip(np.sum((r1 @ R.T) * r2, axis=1), -1, 1)
+        parallax = min(parallax, float(np.degrees(np.median(np.arccos(cos)))))
+    return PairGeometry(int(keep.sum()), parallax)
 
-        pts_1 = np.array([
-            latest_keyframe.keypoints[m.queryIdx].pt for m in good_matches
-        ]).astype(np.float32)
-        pts_2 = np.array([
-            current_frame.keypoints[m.trainIdx].pt for m in good_matches
-        ]).astype(np.float32)
 
-        # Parallax section
+class KeyframeSelector:
+    def __init__(self, config: KeyframeConfig | None = None) -> None:
+        self.config = config or KeyframeConfig()
+        self._sift = cv2.SIFT.create(nfeatures=self.config.max_features)
+        self._matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
-        H, _ = cv2.findHomography(
-            srcPoints= pts_1, 
-            dstPoints= pts_2, 
-            method= cv2.RANSAC, 
-            ransacReprojThreshold= RANSAC_REPROJ_HOMOGRAPHY
-        )
-        F, _ = cv2.findFundamentalMat(
-            points1= pts_1, 
-            points2= pts_2, 
-            method= cv2.FM_RANSAC, 
-            ransacReprojThreshold= RANSAC_REPROJ_FUNDAMENTAL
-        )
+    def select(self, video_path: Path, output_dir: Path) -> list[Keyframe]:
+        """Write keyframes to output_dir/images and metadata to output_dir/keyframes.json."""
+        cfg = self.config
+        image_dir = output_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        if any(image_dir.iterdir()):
+            raise FileExistsError(f"{image_dir} is not empty; use a fresh output directory")
 
-        if H is None or F is None:
-            return False
-        if F.shape != (3, 3):
-            return False
+        step = self._step(video_path)
+        # Two passes: the blur test needs the sharpness of *future* frames too.
+        scores = {i: sharpness(f) for i, f in self._frames(video_path, step)}
+        if not scores:
+            raise ValueError(f"no frames could be read from {video_path}")
+        half_window = max(1, round(cfg.blur_window_s * cfg.process_fps))
+        mask = sharp_mask(np.array(list(scores.values())), half_window, cfg.blur_ratio)
+        sharp = {i for i, ok in zip(scores, mask) if ok}
 
-        H_score = self.symmetric_transfer_score(
-            H, 
-            pts_1, 
-            pts_2, 
-            SYMMETRIC_TRANSFER_SCORE_THRESHOLD
-        )
-        F_score = self.symmetric_epipolar_score(
-            F,
-            pts_1,
-            pts_2,
-            SYMMETRIC_EPIPOLAR_SCORE_THRESHOLD
-        )
+        keyframes: list[Keyframe] = []
+        for frame, reason, geom in self._choose(video_path, step, sharp, scores):
+            name = f"{len(keyframes):05d}.jpg"
+            ok = cv2.imwrite(
+                str(image_dir / name),
+                _resize_long_side(frame.image, cfg.save_size),
+                [cv2.IMWRITE_JPEG_QUALITY, 97],
+            )
+            if not ok:
+                raise OSError(f"could not write {image_dir / name}")
+            keyframes.append(Keyframe(name, frame.index, reason, frame.sharpness, geom.inliers, geom.parallax_deg))
 
-        return (H_score / (H_score + F_score)) <= ACCEPTANCE_RATIO
-        
-    def symmetric_transfer_score(
-            self, 
-            H: MatLike, 
-            pts_1: NDArray[np.float32], 
-            pts_2: NDArray[np.float32], 
-            threshold: float
-    ) -> float:
-        def reprojection_error(
-                H: MatLike, 
-                p1: NDArray[np.float32],
-                p2: NDArray[np.float32]
-        ) -> float:
-            p1_homo = np.array([p1[0], p1[1], 1.0]).astype(np.float32)
-            proj_homo = H @ p1_homo
-            proj = np.array([proj_homo[0], proj_homo[1]] / proj_homo[2]).astype(np.float32)
-            err = proj - p2
-            return err.dot(err)
+        (output_dir / "keyframes.json").write_text(json.dumps({
+            "video": str(video_path),
+            "config": asdict(cfg),
+            "frames_examined": len(scores),
+            "frames_blurry": len(scores) - len(sharp),
+            "keyframes": [asdict(k) for k in keyframes],
+        }, indent=2))
+        return keyframes
 
-        H_inv = np.linalg.inv(H)
-        score = 0.0
-        for p1, p2 in zip(pts_1, pts_2):
-            d1: float = reprojection_error(H, p1, p2)
-            d2: float = reprojection_error(H_inv, p2, p1)
-            for d in (d1, d2):
-                score += max(threshold - d, 0)
-        return score
+    def _choose(
+        self, video_path: Path, step: int, sharp: set[int], scores: dict[int, float]
+    ) -> Iterator[tuple[FrameData, Reason, PairGeometry]]:
+        cfg = self.config
+        reference: FrameData | None = None
+        candidate: tuple[FrameData, PairGeometry] | None = None  # last frame still well tracked
+        best_inliers = 0
 
-    def symmetric_epipolar_score(
-            self, 
-            F: MatLike, 
-            pts_1: NDArray[np.float32], 
-            pts_2: NDArray[np.float32], 
-            threshold: float
-    ) -> float:
-        def epipolar_dist(
-                F: MatLike, 
-                p1: NDArray[np.float32], 
-                p2: NDArray[np.float32]
-        ) -> float:
-            p1_h = np.array([p1[0], p1[1], 1]).astype(np.float32)
-            p2_h = np.array([p2[0], p2[1], 1]).astype(np.float32)
-            l2 = F @ p1_h
-            residual = p2_h @ l2
-            residual_normalized = residual ** 2 / (l2[0] ** 2 + l2[1] ** 2)
-            return residual_normalized
+        for index, image in self._frames(video_path, step):
+            if index not in sharp:
+                continue
+            frame = self._extract(index, image, scores[index])
+            if reference is None:
+                if len(frame.keypoints) >= cfg.min_matches:
+                    reference = frame
+                    yield frame, "first", PairGeometry(0, 0.0)
+                continue
 
-        score = 0.0
-        for p1, p2 in zip(pts_1, pts_2):
-            d1: float = epipolar_dist(F, p1, p2)
-            d2: float = epipolar_dist(F.T, p2, p1)
-            for d in (d1, d2):
-                score += max(threshold - d, 0)
-        return score
+            geom = self._compare(reference, frame)
+            if geom.inliers < cfg.min_matches and candidate is not None:
+                # Tracking was lost: step back to the last good frame, then retry from there.
+                reference, candidate_geom = candidate
+                yield reference, "bridge", candidate_geom
+                candidate, best_inliers = None, 0
+                geom = self._compare(reference, frame)
+
+            if geom.inliers < cfg.min_matches:
+                if len(frame.keypoints) < cfg.min_matches:
+                    continue  # nothing to see here (e.g. blank wall); keep the reference
+                # Never hold on to a reference that has left the view.
+                reason: Reason | None = "break"
+            elif geom.parallax_deg >= cfg.min_parallax_deg:
+                reason = "parallax"
+            elif geom.inliers < cfg.min_overlap * best_inliers:
+                # Mostly rotation: no baseline, but needed to keep the chain connected.
+                reason = "overlap"
+            else:
+                reason = None
+
+            if reason is None:
+                candidate, best_inliers = (frame, geom), max(best_inliers, geom.inliers)
+            else:
+                yield frame, reason, geom
+                reference, candidate, best_inliers = frame, None, 0
+
+    def _step(self, video_path: Path) -> int:
+        video = cv2.VideoCapture(str(video_path))
+        try:
+            if not video.isOpened():
+                raise FileNotFoundError(f"cannot open video {video_path}")
+            fps = video.get(cv2.CAP_PROP_FPS)
+        finally:
+            video.release()
+        return max(1, round(fps / self.config.process_fps)) if fps > 0 else 1
+
+    @staticmethod
+    def _frames(video_path: Path, step: int) -> Iterator[tuple[int, MatLike]]:
+        video = cv2.VideoCapture(str(video_path))
+        try:
+            index = 0
+            while video.grab():
+                if index % step == 0:
+                    ok, image = video.retrieve()
+                    if ok:
+                        yield index, image
+                index += 1
+        finally:
+            video.release()
+
+    def _extract(self, index: int, image: MatLike, score: float) -> FrameData:
+        gray = cv2.cvtColor(_resize_long_side(image, self.config.track_size), cv2.COLOR_BGR2GRAY)
+        keypoints, descriptors = self._sift.detectAndCompute(gray, None)
+        return FrameData(index, image, score, keypoints, descriptors)
+
+    def _compare(self, a: FrameData, b: FrameData) -> PairGeometry:
+        if a.descriptors is None or b.descriptors is None or len(b.keypoints) < 2:
+            return PairGeometry(0, 0.0)
+        matches = [
+            p[0] for p in self._matcher.knnMatch(a.descriptors, b.descriptors, k=2)
+            if len(p) == 2 and p[0].distance < self.config.ratio_test * p[1].distance
+        ]
+        pts_1 = np.array([a.keypoints[m.queryIdx].pt for m in matches], dtype=np.float64)
+        pts_2 = np.array([b.keypoints[m.trainIdx].pt for m in matches], dtype=np.float64)
+        h, w = _resize_long_side(a.image, self.config.track_size).shape[:2]
+        f = self.config.focal_factor * max(h, w)
+        K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
+        return pair_geometry(pts_1, pts_2, K, self.config.ransac_px)
