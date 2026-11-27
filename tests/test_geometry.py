@@ -109,3 +109,23 @@ def test_file_formats(tmp_path):
     data = np.arange(6, dtype=np.float32)
     (tmp_path / "d.bin").write_bytes(b"3&2&1&" + data.tobytes())
     assert read_depth_map(tmp_path / "d.bin").tolist() == data.reshape(2, 3).tolist()
+
+
+def test_level_frame_snaps_to_floor_and_wall():
+    from scipy.spatial.transform import Rotation
+
+    from rr.mesh import level_frame
+
+    # A box room (floor z=0, ceiling z=2.5, walls along x and y), tipped into an arbitrary frame.
+    rng = np.random.default_rng(0)
+    room = rng.uniform([-3, -2, 0], [3, 2, 2.5], (5000, 3))
+    room[:1000, 2] = 0.0
+    turn = Rotation.from_euler("xyz", [50, -20, 110], degrees=True).as_matrix()
+    normals = np.array([[0, 0, 1.0], [0, 0, -1], [1, 0, 0], [0, 1, 0]]) @ turn.T
+    support = np.array([500, 400, 300, 200])
+    # The cameras' 'up' is 10 degrees off; snapping to the floor plane must fix it.
+    camera_up = Rotation.from_euler("x", 10, degrees=True).apply([0, 0, 1.0]) @ turn.T
+    frame = level_frame(normals, support, camera_up, (room - [5, 7, 1]) @ turn.T)
+    assert np.allclose(frame.R @ normals[0], [0, 0, 1], atol=1e-9)        # floor faces up
+    assert np.allclose(abs(frame.R @ normals[2]), [1, 0, 0], atol=1e-9)   # largest wall along x
+    assert abs(np.percentile(frame.apply((room - [5, 7, 1]) @ turn.T)[:, 2], 0.5)) < 1e-6  # floor at z=0

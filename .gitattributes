@@ -1,0 +1,5 @@
+# Pictures and meshes go through Git LFS, so each run does not add ~200 MB to the history.
+# metrics.json and the CSVs stay in plain git, so they diff normally.
+results/**/*.ply filter=lfs diff=lfs merge=lfs -text
+results/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+results/**/*.png filter=lfs diff=lfs merge=lfs -text

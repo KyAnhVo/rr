@@ -105,8 +105,10 @@ def reconstruct_dense(
     pycolmap.patch_match_stereo(output_dir, options=stereo)
     fusion = pycolmap.StereoFusionOptions()
     fusion.max_image_size = cfg.max_image_size
-    fusion.use_cache = True
-    fusion.cache_size = cfg.cache_gb
+    # Without the cache every map is held in RAM (~15 MB per view at 1200 px) and fusion uses
+    # every core; COLMAP's cached mode fuses on a single thread.
+    fusion.use_cache = False
+    fusion.num_threads = -1
     fused_path = output_dir / "fused.ply"
     pycolmap.stereo_fusion(fused_path, output_dir, options=fusion, output_type="PLY")
 

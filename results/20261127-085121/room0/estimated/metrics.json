@@ -1,0 +1,158 @@
+{
+  "scene": "room0",
+  "mode": "estimated",
+  "frames": 2000,
+  "completed": 5,
+  "seconds": {
+    "keyframes": 30.0,
+    "sparse": 77.7,
+    "dense": 4114.6,
+    "segmentation": 14.2,
+    "fusion": 76.3
+  },
+  "keyframes": 273,
+  "sparse": {
+    "model_dir": "/home/lenob0dy/Projects/rr/results/20261127-085121/room0/estimated/sparse/model",
+    "images_total": 273,
+    "images_registered": 273,
+    "num_models": 1,
+    "num_points": 38751,
+    "mean_reprojection_error": 0.3913766934280327,
+    "loop_detection": false
+  },
+  "registered_fraction": 1.0,
+  "trajectory": {
+    "ate_rmse_m": 0.0020595054443084283,
+    "ate_max_m": 0.0047629654015241135,
+    "poses_compared": 273
+  },
+  "gt_visible_fraction": 0.85878,
+  "accuracy_floor_m": 0.004321833213992312,
+  "clouds": {
+    "sparse": {
+      "points": 38751,
+      "accuracy_mean_m": 0.027671157695853286,
+      "accuracy_median_m": 0.007055905230109491,
+      "completeness_mean_m": 0.1868691806136253,
+      "completeness_median_m": 0.13755240538196026,
+      "chamfer_m": 0.1072701691547393,
+      "precision_5cm": 0.9214471884596527,
+      "recall_5cm": 0.2195225,
+      "fscore_5cm": 0.35457276818934025,
+      "visible_recall_5cm": 0.24777009245674095,
+      "visible_completeness_mean_m": 0.1762653731737474
+    },
+    "fused": {
+      "points": 3027641,
+      "accuracy_mean_m": 0.011299557678821195,
+      "accuracy_median_m": 0.00723815759345023,
+      "completeness_mean_m": 0.05879577830491893,
+      "completeness_median_m": 0.016861878015648202,
+      "chamfer_m": 0.03504766799187006,
+      "precision_5cm": 0.9765125,
+      "recall_5cm": 0.77055,
+      "fscore_5cm": 0.861390713697993,
+      "visible_recall_5cm": 0.8854858054449335,
+      "visible_completeness_mean_m": 0.029048322261996756
+    },
+    "plane_fill": {
+      "points": 4684,
+      "accuracy_mean_m": 0.019728255849570036,
+      "accuracy_median_m": 0.010326890195436103,
+      "completeness_mean_m": 0.41176343206665217,
+      "completeness_median_m": 0.356922255349556,
+      "chamfer_m": 0.2157458439581111,
+      "precision_5cm": 0.8595217762596071,
+      "recall_5cm": 0.0841225,
+      "fscore_5cm": 0.15324656216853236,
+      "visible_recall_5cm": 0.08599117352523347,
+      "visible_completeness_mean_m": 0.4174340391524184
+    },
+    "dense": {
+      "points": 3032325,
+      "accuracy_mean_m": 0.011299835485835796,
+      "accuracy_median_m": 0.0072361891397327415,
+      "completeness_mean_m": 0.05478601887677605,
+      "completeness_median_m": 0.016784577120266438,
+      "chamfer_m": 0.03304292718130593,
+      "precision_5cm": 0.9766525,
+      "recall_5cm": 0.78346,
+      "fscore_5cm": 0.86945370554439,
+      "visible_recall_5cm": 0.8960181885931204,
+      "visible_completeness_mean_m": 0.02720494839172794
+    }
+  },
+  "dense": {
+    "num_dense_points": 3027641,
+    "num_planes": 6,
+    "num_plane_fill_points": 4684,
+    "unit": 9.692943572998047,
+    "scene_size": 34.63676255318825
+  },
+  "segmentation": {
+    "images": 273,
+    "model": "facebook/mask2former-swin-large-ade-semantic",
+    "seconds": 14.2,
+    "class_fractions": {
+      "wall": 0.27732886030976855,
+      "floor": 0.08203391281582362,
+      "ceiling": 0.0661825147509708,
+      "door": 0.015629085888912132,
+      "window": 0.06292351993666663,
+      "other structure": 2.7886882543622757e-05,
+      "object": 0.4958742194153147
+    }
+  },
+  "fusion": {
+    "points": 3032325,
+    "views": 273,
+    "labeled_by_votes": 2980856,
+    "labeled_by_plane": 51467,
+    "labeled_by_neighbours": 2,
+    "unlabeled": 0,
+    "structure_points": 1332642,
+    "object_points": 1699683,
+    "class_counts": {
+      "wall": 674225,
+      "floor": 244232,
+      "ceiling": 206880,
+      "door": 63201,
+      "window": 144104,
+      "other structure": 0,
+      "object": 1699683
+    }
+  },
+  "semantic_frame_offset_m": 0.0,
+  "labels": {
+    "single view": {
+      "points_scored": 2927877,
+      "fraction_scored": 0.9655551433306127,
+      "iou_structure": 0.7920316521907683,
+      "iou_object": 0.839339989881401,
+      "accuracy": 0.9003264139852869,
+      "miou": 0.8156858210360847,
+      "class_accuracy": 0.867111903949517,
+      "class_miou": 0.5930628435599353
+    },
+    "multi-view votes": {
+      "points_scored": 2927877,
+      "fraction_scored": 0.9655551433306127,
+      "iou_structure": 0.8395229010500384,
+      "iou_object": 0.881967988341317,
+      "accuracy": 0.9270269891802149,
+      "miou": 0.8607454446956777,
+      "class_accuracy": 0.8885513291712732,
+      "class_miou": 0.5846095039403876
+    },
+    "final (+ plane prior, neighbours)": {
+      "points_scored": 2928772,
+      "fraction_scored": 0.965850296389734,
+      "iou_structure": 0.8431765020509479,
+      "iou_object": 0.8849561483495532,
+      "accuracy": 0.9289214046023384,
+      "miou": 0.8640663252002505,
+      "class_accuracy": 0.8906145647390784,
+      "class_miou": 0.5853946640401143
+    }
+  }
+}

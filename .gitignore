@@ -5,13 +5,27 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
-# Virtual environments
+# Virtual environments (make setup recreates them)
 .venv
 .venv-seg
 
-# Datasets and generated results
-/room-data/
-/results/
+# Local Claude Code settings
+.claude/settings.local.json
 
-./rgbd_dataset_freiburg3_long_office_household/**
+# Datasets: re-downloadable, and Replica's terms do not allow redistributing them
+/room-data/
+/rgbd_dataset_freiburg3_long_office_household/
+*.tgz
+*:Zone.Identifier
+
+# Results: only the end products are tracked (pictures, meshes, metrics); intermediates stay
+# on disk but out of git, so a tracked run cannot be resumed, only re-run.
+results/**
+!results/**/
+!results/**/pictures/**
+!results/**/mesh/**
+!results/**/metrics.json
+!results/*/summary.csv
+!results/*/labels.csv
