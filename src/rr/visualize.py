@@ -1,4 +1,6 @@
-"""Headless point-cloud pictures: outside views, and video frame vs. reconstruction."""
+"""Headless pictures: outside views, video frame vs. reconstruction, segmentation, overview."""
+import json
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
@@ -10,6 +12,11 @@ from scipy.spatial import cKDTree
 from rr.evaluation import Similarity
 from rr.ply import PointCloud
 from rr.sources import FrameSource
+from rr.taxonomy import COLORS, UNKNOWN_COLOR, binary_colors, class_colors
+
+# Extra image columns for frame_comparisons: (image name, cell size) -> [(title, BGR image)].
+ExtraColumns = Callable[[str, tuple[int, int]], list[tuple[str, MatLike]]]
+OUTSIDE = [("top", 0, 89.0)] + [(f"corner_{a}", a, 35.0) for a in (45, 135, 225, 315)]
 
 BACKGROUND = 255
 
@@ -111,55 +118,179 @@ def facing_cameras(cloud: PointCloud, model) -> PointCloud:
     return PointCloud(cloud.points, n / np.linalg.norm(n, axis=1, keepdims=True), cloud.colors)
 
 
+class OutsideCameras:
+    """Cameras around a z-up scene, framed on `reference`, shared by every cloud drawn."""
+
+    def __init__(self, reference: NDArray, size: tuple[int, int]) -> None:
+        self.lo, self.hi = np.percentile(reference, [1, 99], axis=0)
+        self.size = size
+        self.K = np.array([[size[1] * 1.2, 0, size[0] / 2], [0, size[1] * 1.2, size[1] / 2], [0, 0, 1]])
+        center, extent = (self.lo + self.hi) / 2, float(np.linalg.norm(self.hi - self.lo))
+        self.poses = {}
+        for name, azimuth, elevation in OUTSIDE:
+            a, e = np.radians(azimuth), np.radians(elevation)
+            eye = center + 1.25 * extent * np.array([np.cos(a) * np.cos(e), np.sin(a) * np.cos(e), np.sin(e)])
+            self.poses[name] = _look_at(eye, center, np.array([0, 0, 1.0]))
+
+    def render(self, view: str, cloud: PointCloud, radius: int) -> MatLike:
+        margin = 0.15 * (self.hi - self.lo)
+        inside = np.all((cloud.points > self.lo - margin) & (cloud.points < self.hi + margin), axis=1)
+        return render(cloud[inside], self.K, self.poses[view], self.size, radius, bool(np.any(cloud.normals)))
+
+
 def outside_views(clouds: dict[str, tuple[PointCloud, int]], output: Path, size: tuple[int, int] = (720, 540)) -> None:
     """Top view plus four corners, one row per view and one column per cloud.
 
     Clouds are z-up, and all are drawn from the same cameras, framed on the first one.
     """
-    reference = next(iter(clouds.values()))[0].points
-    lo, hi = np.percentile(reference, [1, 99], axis=0)
-    center, extent = (lo + hi) / 2, float(np.linalg.norm(hi - lo))
-    margin = 0.15 * (hi - lo)
-    K = np.array([[size[1] * 1.2, 0, size[0] / 2], [0, size[1] * 1.2, size[1] / 2], [0, 0, 1]])
+    cameras = OutsideCameras(next(iter(clouds.values()))[0].points, size)
     rows = []
-    for name, azimuth, elevation in [("top", 0, 89.0)] + [(f"corner_{a}", a, 35.0) for a in (45, 135, 225, 315)]:
-        a, e = np.radians(azimuth), np.radians(elevation)
-        eye = center + 1.25 * extent * np.array([np.cos(a) * np.cos(e), np.sin(a) * np.cos(e), np.sin(e)])
+    for name in cameras.poses:
         cells = []
         for label, (cloud, radius) in clouds.items():
-            inside = np.all((cloud.points > lo - margin) & (cloud.points < hi + margin), axis=1)
-            pose = _look_at(eye, center, np.array([0, 0, 1.0]))
-            image = render(cloud[inside], K, pose, size, radius, bool(np.any(cloud.normals)))
-            _save(output / f"{name}_{label.replace(' ', '_')}.png", image)
+            image = cameras.render(name, cloud, radius)
+            _save(output / f"{name}_{_slug(label)}.png", image)
             cells.append(_label(image, f"{label}: {name}"))
         rows.append(np.hstack(cells))
         _save(output / f"{name}.png", rows[-1])
     _save(output / "sheet.png", np.vstack(rows))
 
 
-def frame_comparisons(
-    model, image_dir: Path, clouds: dict[str, tuple[PointCloud, int]], output: Path, count: int = 6
-) -> None:
-    """Keyframe next to each cloud seen from the same estimated camera."""
+def _slug(text: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in text.lower()).strip("_")
+
+
+def _photo(model, image, image_dir: Path, width: int) -> tuple[MatLike, NDArray, NDArray, tuple[int, int]]:
+    """Keyframe undistorted to match pinhole renders, with K, pose and size at `width`."""
+    photo = cv2.imread(str(image_dir / image.name))
+    if photo is None:
+        raise FileNotFoundError(image_dir / image.name)
+    camera = model.cameras[image.camera_id]
+    K = np.array(camera.calibration_matrix())
+    if camera.model.name == "SIMPLE_RADIAL":
+        photo = cv2.undistort(photo, K.copy(), np.array([camera.params[3], 0, 0, 0], dtype=np.float64))
+    scale = width / camera.width
+    size = (width, round(camera.height * scale))
+    K[:2] *= scale
+    return cv2.resize(photo, size), K, np.array(image.cam_from_world().matrix()), size
+
+
+def _spread(model, count: int) -> list:
     images = sorted(model.images.values(), key=lambda i: i.name)
+    return [images[k] for k in np.unique(np.linspace(0, len(images) - 1, min(count, len(images))).round().astype(int))]
+
+
+def frame_comparisons(
+    model, image_dir: Path, clouds: dict[str, tuple[PointCloud, int]], output: Path, count: int = 6,
+    extra: ExtraColumns | None = None,
+) -> None:
+    """Keyframe next to each cloud seen from the same estimated camera (clouds in model frame)."""
     rows = []
-    for k in np.unique(np.linspace(0, len(images) - 1, min(count, len(images))).round().astype(int)):
-        image = images[k]
-        photo = cv2.imread(str(image_dir / image.name))
-        assert photo is not None
-        camera = model.cameras[image.camera_id]
-        K = np.array(camera.calibration_matrix())
-        scale = 640 / camera.width
-        size = (640, round(camera.height * scale))
-        K[:2] *= scale
-        # Undo lens distortion so that the photo matches the pinhole renders.
-        if camera.model.name == "SIMPLE_RADIAL":
-            full = np.array(camera.calibration_matrix())
-            photo = cv2.undistort(photo, full, np.array([camera.params[3], 0, 0, 0], dtype=np.float64))
-        pose = np.array(image.cam_from_world().matrix())
-        cells = [_label(cv2.resize(photo, size), f"video {image.name}")]
+    for image in _spread(model, count):
+        photo, K, pose, size = _photo(model, image, image_dir, 640)
+        cells = [_label(photo, f"video {image.name}")]
+        cells += [_label(cv2.resize(e, size, interpolation=cv2.INTER_NEAREST), n) for n, e in (extra(image.name, size) if extra else [])]
         cells += [_label(render(c, K, pose, size, r), n) for n, (c, r) in clouds.items()]
         row = np.hstack(cells)
         _save(output / f"{Path(image.name).stem}.png", row)
         rows.append(row)
     _save(output / "sheet.png", np.vstack(rows))
+
+
+def recolored(cloud: PointCloud, colors: NDArray[np.uint8]) -> PointCloud:
+    return PointCloud(cloud.points, cloud.normals, colors)
+
+
+def class_cloud(cloud: PointCloud, classes: NDArray) -> PointCloud:
+    return recolored(cloud, class_colors(classes))
+
+
+def binary_cloud(cloud: PointCloud, classes: NDArray) -> PointCloud:
+    return recolored(cloud, binary_colors(classes))
+
+
+def ade_palette() -> NDArray[np.uint8]:
+    """BGR colour per ADE20K id; 255 (unlabelled) is grey."""
+    palette = np.random.default_rng(3).integers(40, 256, (256, 3)).astype(np.uint8)
+    palette[255] = UNKNOWN_COLOR
+    return palette
+
+
+def coarse_image(coarse: NDArray[np.int8]) -> MatLike:
+    """BGR picture of a coarse class map."""
+    image = np.empty((*coarse.shape, 3), np.uint8)
+    image[:] = UNKNOWN_COLOR[::-1]
+    known = coarse >= 0
+    image[known] = COLORS[coarse[known]][:, ::-1]
+    return image
+
+
+def structure_overlay(photo: MatLike, coarse: NDArray[np.int8]) -> MatLike:
+    """Photo tinted blue on structure and orange on objects."""
+    tint = np.ascontiguousarray(binary_colors(coarse.ravel()).reshape(*coarse.shape, 3)[..., ::-1])
+    return cv2.addWeighted(photo, 0.5, tint, 0.5, 0)
+
+
+def segmentation_sheet(image_dir: Path, seg_dir: Path, output: Path, count: int = 6) -> None:
+    """Per keyframe: photo | ADE20K classes | coarse classes | structure/object overlay."""
+    from rr.phase4 import read_labels, read_lookup
+
+    lookup, palette = read_lookup(seg_dir), ade_palette()
+    id2label = json.loads((seg_dir / "classes.json").read_text())["id2label"]
+    names = sorted(p.name for p in image_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    rows = []
+    for name in [names[i] for i in np.unique(np.linspace(0, len(names) - 1, min(count, len(names))).round().astype(int))]:
+        photo, ade = cv2.imread(str(image_dir / name)), read_labels(seg_dir, name)
+        if photo is None or ade is None:
+            continue
+        coarse = lookup[ade]
+        classes = palette[ade]
+        # Name the three largest ADE20K classes in the picture.
+        ids, counts = np.unique(ade[ade != 255], return_counts=True)
+        top = ", ".join(id2label.get(str(i), "?").split(",")[0] for i in ids[np.argsort(-counts)][:3])
+        cells = [_label(photo, f"keyframe {name}"), _label(classes, f"p4 ADE20K: {top}"),
+                 _label(coarse_image(coarse), "p4 coarse classes"), _label(structure_overlay(photo, coarse), "p4 structure / object")]
+        width = 480
+        cells = [cv2.resize(c, (width, round(c.shape[0] * width / c.shape[1])), interpolation=cv2.INTER_NEAREST) for c in cells]
+        row = np.hstack(cells)
+        _save(output / f"{Path(name).stem}.png", row)
+        rows.append(row)
+    if rows:
+        _save(output / "sheet.png", np.vstack(rows))
+
+
+def in_world(cam_from_model: NDArray, world: Similarity) -> NDArray:
+    """A model-frame camera as a camera on world points (same image, depth scaled by world.scale)."""
+    R = cam_from_model[:, :3] @ world.R.T
+    return np.column_stack([R, world.scale * cam_from_model[:, 3] - R @ world.t])
+
+
+def _blank(size: tuple[int, int], text: str) -> MatLike:
+    image = np.full((size[1], size[0], 3), 235, np.uint8)
+    cv2.putText(image, text, (12, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 90, 90), 2, cv2.LINE_AA)
+    return image
+
+
+def overview(
+    model, image_dir: Path, world: Similarity, clouds: list[tuple[str, PointCloud, int]], output: Path,
+    labels_2d: Callable[[str], MatLike | None] | None = None, cell: int = 420, inside_count: int = 3,
+) -> None:
+    """All phases on one sheet. Columns: p1 video, [p4 2D labels], then each cloud (world frame).
+    Rows: top and two corner views from outside, then a few keyframe cameras from inside."""
+    outside = OutsideCameras(clouds[0][1].points, (cell, round(cell * 0.75)))
+    titles = ["p1 video"] + (["p4 2D labels"] if labels_2d else []) + [t for t, _, _ in clouds]
+    rows = []
+    for view in ("top", "corner_45", "corner_225"):
+        cells = [_blank(outside.size, f"outside: {view}")] + ([_blank(outside.size, "")] if labels_2d else [])
+        cells += [outside.render(view, c, r) for _, c, r in clouds]
+        rows.append(cells)
+    for image in _spread(model, inside_count + 2)[1:-1]:
+        photo, K, pose, size = _photo(model, image, image_dir, cell)
+        cells = [photo]
+        if labels_2d:
+            labels = labels_2d(image.name)
+            cells.append(_blank(size, "no labels") if labels is None else cv2.resize(labels, size, interpolation=cv2.INTER_NEAREST))
+        cells += [render(c, K, in_world(pose, world), size, r) for _, c, r in clouds]
+        rows.append(cells)
+    sheet = [np.hstack([_label(c, f"{t}") for c, t in zip(cells, titles)]) for cells in rows]
+    _save(output, np.vstack(sheet))

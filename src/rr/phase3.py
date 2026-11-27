@@ -1,4 +1,4 @@
-"""Stage 3: dense reconstruction (PatchMatch MVS) plus RANSAC planes."""
+"""Stage 3: dense reconstruction (PatchMatch MVS) plus RANSAC plane segments and gap filling."""
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,8 +24,25 @@ class DenseConfig:
 @dataclass
 class DenseResult:
     num_dense_points: int
-    num_planes: int
+    num_planes: int                    # plane segments
     num_plane_fill_points: int
+    unit: float = 0.0                  # typical viewing distance, the planes' length unit
+    scene_size: float = 0.0            # robust bounding-box diagonal, for comparison
+
+
+def viewing_distance(dense_dir: Path, views: int = 25) -> float:
+    """Median camera-to-surface distance, from a spread of MVS depth maps (model units)."""
+    paths = sorted((dense_dir / "stereo" / "depth_maps").glob("*.geometric.bin"))
+    if not paths:
+        raise RuntimeError(f"no depth maps in {dense_dir}")
+    medians = []
+    for path in paths[:: max(1, len(paths) // views)]:
+        depth = read_depth_map(path)
+        if (depth > 0).any():
+            medians.append(float(np.median(depth[depth > 0])))
+    if not medians:
+        raise RuntimeError(f"every depth map in {dense_dir} is empty")
+    return float(np.median(medians))
 
 
 def seen_through(
@@ -96,10 +113,10 @@ def reconstruct_dense(
     cloud = read_ply(fused_path)
     if len(cloud) == 0:
         raise RuntimeError("dense fusion produced no points")
-    size = scene_size(cloud.points)
-    planes = fit_planes(cloud, cfg.planes)
+    unit = viewing_distance(output_dir)
+    planes = fit_planes(cloud, unit, cfg.planes)
     fills = [
-        _remove_free_space(fill_plane(cloud, p, size, cfg.planes), output_dir, pycolmap, cfg) for p in planes
+        _remove_free_space(fill_plane(cloud, p, unit, cfg.planes), output_dir, pycolmap, cfg) for p in planes
     ]
     empty = cloud[np.zeros(0, dtype=np.int64)]
     fill = concatenate([empty, *fills])
@@ -122,6 +139,6 @@ def reconstruct_dense(
         point_plane=point_plane,
         fill_plane=np.concatenate([np.full(len(f), i, np.int32) for i, f in enumerate(fills)] or [np.zeros(0, np.int32)]),
     )
-    result = DenseResult(len(cloud), len(planes), len(fill))
+    result = DenseResult(len(cloud), len(planes), len(fill), unit, scene_size(cloud.points))
     (output_dir / "dense.json").write_text(json.dumps(asdict(result) | {"config": asdict(cfg)}, indent=2))
     return result

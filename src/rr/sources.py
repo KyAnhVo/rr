@@ -9,7 +9,6 @@ from cv2.typing import MatLike
 from numpy.typing import NDArray
 
 from rr.replica import ReplicaReader
-from rr.sens import SensReader
 
 
 class FrameSource(Protocol):
@@ -61,4 +60,4 @@ class VideoSource:
 def open_source(path: Path) -> FrameSource:
     if path.is_dir():
         return ReplicaReader(path)
-    return SensReader(path) if path.suffix == ".sens" else VideoSource(path)
+    return VideoSource(path)

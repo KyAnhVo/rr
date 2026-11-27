@@ -5,7 +5,7 @@ import pytest
 from rr.colmap import read_depth_map
 from rr.phase1 import pair_geometry, sharp_mask
 from rr.phase3 import seen_through
-from rr.planes import PlaneConfig, fill_plane, fit_planes, scene_size
+from rr.planes import PlaneConfig, fill_plane, fit_planes
 from rr.ply import PointCloud, read_ply, write_ply
 
 K = np.array([[1000.0, 0, 640], [0, 1000, 360], [0, 0, 1]])
@@ -57,13 +57,41 @@ def test_planes_and_fill_respect_outline():
         np.concatenate([np.tile([0, 0, 1.0], (len(a), 1)), np.tile([0, 1.0, 0], (len(b), 1))]),
         np.full((len(a) + len(b), 3), 128, np.uint8),
     )
-    planes = fit_planes(cloud, PlaneConfig())
+    planes = fit_planes(cloud, 1.5, PlaneConfig())
     assert len(planes) == 2
     wall_plane = next(p for p in planes if abs(p.normal[2]) > 0.999)
-    fill = fill_plane(cloud, wall_plane, scene_size(cloud.points))
+    fill = fill_plane(cloud, wall_plane, 1.5)
     assert wall_plane.distance(fill.points).max() < 1e-9
     assert np.all(np.abs(fill.points[:, :2] - 2) < 0.2, axis=1).sum() > 50
     assert fill.points[:, :2].min() > -0.1 and fill.points[:, :2].max() < 4.1
+
+
+def floor_patches(gap, scale=1.0):
+    """Two 2 m x 2 m patches of one floor plane, `gap` metres apart, all scaled by `scale`."""
+    rng = np.random.default_rng(4)
+    a = rng.uniform(0, 2, (20000, 2))
+    b = rng.uniform(0, 2, (20000, 2)) + [2 + gap, 0]
+    xy = np.concatenate([a, b])
+    points = np.column_stack([xy, rng.normal(0, 0.002, len(xy))]) * scale
+    return PointCloud(points, np.tile([0, 0, 1.0], (len(points), 1)), np.full((len(points), 3), 128, np.uint8))
+
+
+def test_coplanar_pieces_become_separate_segments():
+    """A doorway-sized gap splits a plane; a small crack does not."""
+    apart = fit_planes(floor_patches(1.5), 1.5)
+    assert len(apart) == 2 and all(abs(p.normal[2]) > 0.999 for p in apart)
+    assert sorted(len(p.inliers) for p in apart) == [20000, 20000]
+    assert len(fit_planes(floor_patches(0.2), 1.5)) == 1
+
+
+def test_planes_do_not_depend_on_scene_scale():
+    """No metric scale: the same scene 10x larger, with a 10x viewing distance, gives the same result."""
+    small, large = floor_patches(1.5), floor_patches(1.5, 10.0)
+    p_small, p_large = fit_planes(small, 1.5), fit_planes(large, 15.0)
+    assert len(p_small) == len(p_large) == 2
+    fill_small = sum(len(fill_plane(small, p, 1.5)) for p in p_small)
+    fill_large = sum(len(fill_plane(large, p, 15.0)) for p in p_large)
+    assert fill_small > 0 and abs(fill_large - fill_small) <= 0.05 * fill_small
 
 
 def test_seen_through():

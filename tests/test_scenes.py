@@ -2,7 +2,9 @@
 
 Writes pictures and metrics.json to results/<time>/<scene>/<mode>/. Thresholds only catch
 breakage; judge quality from the metrics. ROOM_DATA and RR_DENSE_SIZE override the defaults.
+Stage 4 needs the .venv-seg environment (or RR_SEG_PYTHON); without it, stages 4-5 fail.
 """
+import json
 import os
 import time
 import traceback
@@ -35,8 +37,15 @@ def run(request):
         error = e
         out.mkdir(parents=True, exist_ok=True)
         (out / "FAILED.txt").write_text("".join(traceback.format_exception(e)))
+        if (out / "metrics.json").exists():
+            metrics = json.loads((out / "metrics.json").read_text())
     write_summary(OUT)
     return scene, out, metrics, error
+
+
+def completed(run, stage):
+    _, _, m, error = run
+    assert m.get("completed", 0) >= stage, f"stopped after stage {m.get('completed', 0)}: {error!r}"
 
 
 def test_recording(run):
@@ -48,30 +57,62 @@ def test_recording(run):
 
 
 def test_keyframes(run):
+    completed(run, 1)
+    pictures = run[1] / "pictures"
     assert len(list((run[1] / "images").glob("*.jpg"))) >= 10
-    assert (run[1] / "pictures/original/sheet.jpg").exists() and (run[1] / "pictures/keyframes.jpg").exists()
+    for name in ("p1_original/sheet.jpg", "p1_keyframes.jpg", "p1_timeline.png"):
+        assert (pictures / name).exists(), name
 
 
 def test_sparse(run):
-    _, out, m, error = run
-    assert (out / "pictures/inside_sparse/sheet.png").exists(), error
-    if error is None:
-        assert m["registered_fraction"] > 0.5 and m["trajectory"]["ate_rmse_m"] < 0.5
+    completed(run, 2)
+    _, out, m, _ = run
+    for name in ("p2_sparse_inside/sheet.png", "p2_sparse_outside/sheet.png", "p2_trajectory.png"):
+        assert (out / "pictures" / name).exists(), name
+    assert m["registered_fraction"] > 0.5 and m["trajectory"]["ate_rmse_m"] < 0.5
 
 
 def test_dense(run):
-    _, out, m, error = run
-    assert error is None, error
+    completed(run, 3)
+    _, out, m, _ = run
     assert m["clouds"]["fused"]["precision_5cm"] > 0.3
-    for name in ("inside", "outside"):
-        assert (out / "pictures" / name / "sheet.png").exists()
+    for name in ("p3_dense_inside/sheet.png", "p3_dense_outside/sheet.png", "p3_scores.png", "all_in_one.jpg"):
+        assert (out / "pictures" / name).exists(), name
 
 
 def test_plane_files(run):
-    _, out, _, error = run
-    assert error is None, error
+    completed(run, 3)
+    out = run[1]
     z = np.load(out / "dense/planes.npz")
     fused, fill = read_ply(out / "dense/fused.ply"), read_ply(out / "dense/plane_fill.ply")
     assert len(z["point_plane"]) == len(fused) and len(z["fill_plane"]) == len(fill)
     for i, e in enumerate(z["equations"]):
         assert np.abs(fill.points[z["fill_plane"] == i] @ e[:3] + e[3]).max(initial=0) < 1e-3
+
+
+def test_segmentation(run):
+    completed(run, 4)
+    _, out, m, _ = run
+    labels = list((out / "segmentation/labels").glob("*.png"))
+    assert len(labels) == len(list((out / "dense/images").iterdir())) == m["segmentation"]["images"]
+    # A room: the network should find a good deal of wall, floor or ceiling.
+    shares = m["segmentation"]["class_fractions"]
+    assert shares["wall"] + shares["floor"] + shares["ceiling"] > 0.2
+    for name in ("p4_segmentation/sheet.png", "p4_classes.png"):
+        assert (out / "pictures" / name).exists(), name
+
+
+def test_fusion(run):
+    completed(run, 5)
+    _, out, m, _ = run
+    z = np.load(out / "semantic/labels.npz")
+    dense = read_ply(out / "dense/dense.ply")
+    assert len(z["classes"]) == len(dense) and int(z["num_fused"]) == len(read_ply(out / "dense/fused.ply"))
+    assert (z["classes"] >= 0).all(), "every point gets a label"
+    parts = sum(len(read_ply(out / "semantic" / f"{n}.ply")) for n in ("structure", "objects"))
+    assert parts == len(dense)
+    assert m["fusion"]["labeled_by_votes"] > 0.5 * len(dense)
+    for name in ("p5_labels_inside/sheet.png", "p5_labels_outside/sheet.png", "p5_classes.png", "all_in_one.jpg"):
+        assert (out / "pictures" / name).exists(), name
+    if "labels" in m:  # only with Replica's semantic ground truth
+        assert m["labels"]["final (+ plane prior, neighbours)"]["accuracy"] > 0.6

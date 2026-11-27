@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 rr = "rr:main"
 rr-benchmark = "rr.benchmark:main"
+rr-segment = "rr.phase4:main"
 
 [tool.pyright]
 include = ["src", "tests"]
@@ -40,12 +41,13 @@ build-backend = "uv_build"
 dev = ["pytest>=8"]
 # Stages 2-3. Needs CUDA 12; torch pins CUDA 13, so the two cannot share an environment.
 colmap = ["pycolmap-cuda12>=4.2.1; python_version < '3.15' and sys_platform == 'linux'"]
-# Stage 4.
+# Stage 4 (Mask2Former via transformers). Weights download from Hugging Face on first use.
 segmentation = [
     "torch>=2.15.0",
     "torchaudio>=2.11.1",
     "torchcodec>=0.0.0.dev0",
     "torchvision>=0.29.2",
+    "transformers>=4.45",
 ]
 
 [tool.uv]

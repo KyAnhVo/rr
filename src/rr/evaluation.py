@@ -42,14 +42,19 @@ def umeyama(src: Array, dst: Array) -> Similarity:
     return Similarity(scale, R, md - scale * R @ ms)
 
 
-def align_cameras(model: Any, frame_of: dict[str, int], recording: Recording) -> tuple[Similarity, dict[str, float]]:
+def camera_positions(model: Any, frame_of: dict[str, int], recording: Recording) -> tuple[Array, Array]:
+    """Estimated and true camera centres of the registered keyframes, in keyframe order."""
     src, dst = [], []
-    for image in model.images.values():
+    for image in sorted(model.images.values(), key=lambda i: i.name):
         pose = recording.color_pose(frame_of[image.name])
         if pose is not None:
             src.append(image.projection_center())
             dst.append(pose[:3, 3])
-    a, b = np.array(src).reshape(-1, 3), np.array(dst).reshape(-1, 3)
+    return np.array(src).reshape(-1, 3), np.array(dst).reshape(-1, 3)
+
+
+def align_cameras(model: Any, frame_of: dict[str, int], recording: Recording) -> tuple[Similarity, dict[str, float]]:
+    a, b = camera_positions(model, frame_of, recording)
     sim = umeyama(a, b)
     err = np.linalg.norm(sim.apply(a) - b, axis=1)
     return sim, {

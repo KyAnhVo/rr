@@ -8,7 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-seg
 
 # Datasets and generated results
 /room-data/
 /results/
+
+./rgbd_dataset_freiburg3_long_office_household/**

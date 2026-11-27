@@ -1,115 +1,18 @@
-"""Stage 1: keyframe selection.
-
-A frame becomes a keyframe when it is sharp relative to its neighbours and has
-enough *rotation-compensated* parallax w.r.t. the previous keyframe. We avoid a
-homography/fundamental score ratio here: a homography explains pure rotation, but
-also a translating camera looking at a single wall, which we want to keep.
-"""
+"""Walks the video once for sharpness, then again to pick and write keyframes."""
 import json
-from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
 
 import cv2
 import numpy as np
 from cv2.typing import MatLike
 from numpy.typing import NDArray
-from scipy.ndimage import median_filter
 
+from rr.phase1.config import FrameData, Keyframe, KeyframeConfig, PairGeometry, Reason
+from rr.phase1.geometry import camera_matrix, pair_geometry
+from rr.phase1.sharpness import resize_long_side, sharp_mask, sharpness
 from rr.sources import FrameSource
-
-Reason = Literal["first", "parallax", "overlap", "bridge", "break"]
-
-
-@dataclass
-class KeyframeConfig:
-    process_fps: float = 10.0        # frames examined per second of video
-    track_size: int = 1280           # long side used for SIFT tracking
-    save_size: int = 1920            # long side of the saved keyframes
-    blur_ratio: float = 0.6          # sharpness floor, relative to the local median
-    blur_window_s: float = 1.0       # half width of that local window
-    ratio_test: float = 0.75         # Lowe's ratio test
-    max_features: int = 3000
-    min_matches: int = 40            # fewer epipolar inliers than this = tracking lost
-    min_parallax_deg: float = 1.5    # median parallax after removing rotation
-    min_overlap: float = 0.35        # inliers relative to the keyframe's best match count
-    focal_factor: float = 0.8        # focal guess = factor * long side (phones ~0.7-0.8)
-    ransac_px: float = 1.5
-
-
-@dataclass
-class FrameData:
-    index: int
-    image: MatLike
-    sharpness: float
-    keypoints: Sequence[cv2.KeyPoint]
-    descriptors: MatLike | None
-
-
-@dataclass
-class PairGeometry:
-    inliers: int
-    parallax_deg: float
-
-
-@dataclass
-class Keyframe:
-    name: str
-    frame_index: int
-    reason: Reason
-    sharpness: float
-    inliers: int
-    parallax_deg: float
-
-
-def _resize_long_side(image: MatLike, size: int) -> MatLike:
-    scale = size / max(image.shape[:2])
-    if scale >= 1:
-        return image
-    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-
-def sharpness(image: MatLike) -> float:
-    """Variance of the Laplacian at a fixed resolution."""
-    gray = cv2.cvtColor(_resize_long_side(image, 640), cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def sharp_mask(scores: NDArray[np.float64], half_window: int, ratio: float) -> NDArray[np.bool_]:
-    """Compare against a local median: plain walls score low even in perfect focus."""
-    if len(scores) == 0:
-        return np.zeros(0, dtype=bool)
-    return scores >= ratio * median_filter(scores, size=2 * half_window + 1, mode="nearest")
-
-
-def pair_geometry(
-    pts_1: NDArray[np.float64], pts_2: NDArray[np.float64], K: NDArray[np.float64], ransac_px: float
-) -> PairGeometry:
-    """Epipolar inliers, and the parallax that remains once rotation is undone."""
-    if len(pts_1) < 8:
-        return PairGeometry(0, 0.0)
-    E, mask = cv2.findEssentialMat(pts_1, pts_2, K, method=cv2.USAC_MAGSAC, prob=0.999, threshold=ransac_px)
-    if E is None or E.shape != (3, 3) or mask is None:
-        return PairGeometry(0, 0.0)
-    keep = mask.ravel().astype(bool)
-    if keep.sum() < 8:
-        return PairGeometry(int(keep.sum()), 0.0)
-
-    K_inv = np.linalg.inv(K)
-
-    def rays(pts: NDArray[np.float64]) -> NDArray[np.float64]:
-        r = np.column_stack([pts, np.ones(len(pts))]) @ K_inv.T
-        return r / np.linalg.norm(r, axis=1, keepdims=True)
-
-    r1, r2 = rays(pts_1[keep]), rays(pts_2[keep])
-    # Of the two rotations in E, take the one leaving the least parallax. Unlike a
-    # cheirality vote, this stays well defined when translation is ~0.
-    parallax = np.inf
-    for R in cv2.decomposeEssentialMat(E)[:2]:
-        cos = np.clip(np.sum((r1 @ R.T) * r2, axis=1), -1, 1)
-        parallax = min(parallax, float(np.degrees(np.median(np.arccos(cos)))))
-    return PairGeometry(int(keep.sum()), parallax)
 
 
 class KeyframeSelector:
@@ -142,7 +45,7 @@ class KeyframeSelector:
             name = f"{len(keyframes):05d}.jpg"
             ok = cv2.imwrite(
                 str(image_dir / name),
-                _resize_long_side(frame.image, cfg.save_size),
+                resize_long_side(frame.image, cfg.save_size),
                 [cv2.IMWRITE_JPEG_QUALITY, 97],
             )
             if not ok:
@@ -155,6 +58,8 @@ class KeyframeSelector:
             "frames_examined": len(scores),
             "frames_blurry": len(scores) - len(sharp),
             "keyframes": [asdict(k) for k in keyframes],
+            # [frame index, sharpness, passed the blur test]
+            "frame_sharpness": [[i, round(s, 2), int(i in sharp)] for i, s in scores.items()],
         }, indent=2))
         return keyframes
 
@@ -207,7 +112,7 @@ class KeyframeSelector:
         return max(1, round(source.fps / self.config.process_fps)) if source.fps > 0 else 1
 
     def _extract(self, index: int, image: MatLike, score: float) -> FrameData:
-        gray = cv2.cvtColor(_resize_long_side(image, self.config.track_size), cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(resize_long_side(image, self.config.track_size), cv2.COLOR_BGR2GRAY)
         keypoints, descriptors = self._sift.detectAndCompute(gray, None)
         return FrameData(index, image, score, keypoints, descriptors)
 
@@ -220,12 +125,7 @@ class KeyframeSelector:
         ]
         pts_1 = np.array([a.keypoints[m.queryIdx].pt for m in matches], dtype=np.float64)
         pts_2 = np.array([b.keypoints[m.trainIdx].pt for m in matches], dtype=np.float64)
-        h, w = _resize_long_side(a.image, self.config.track_size).shape[:2]
-        if self._intrinsics is None:
-            f = self.config.focal_factor * max(h, w)
-            K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
-        else:
-            K = self._intrinsics.copy()
-            K[0] *= w / a.image.shape[1]
-            K[1] *= h / a.image.shape[0]
+        h, w = resize_long_side(a.image, self.config.track_size).shape[:2]
+        full_h, full_w = a.image.shape[:2]
+        K = camera_matrix(w, h, self.config.focal_factor, self._intrinsics, (full_w, full_h))
         return pair_geometry(pts_1, pts_2, K, self.config.ransac_px)

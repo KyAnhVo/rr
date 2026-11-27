@@ -16,6 +16,13 @@ from rr.colmap import load_pycolmap
 class SparseConfig:
     matcher: Literal["sequential", "exhaustive"] = "sequential"
     overlap: int = 15                  # neighbours matched per image (sequential)
+    # Sequential matching only links nearby keyframes, so returning to a place after a long
+    # walk (another room, a loop around a large space) drifts. Loop detection also matches
+    # each keyframe against visually similar ones from anywhere in the video. "auto" turns it
+    # on for long videos only, where such returns are likely and the extra time is small.
+    loops: Literal["auto", "on", "off"] = "auto"
+    loops_after: int = 300             # "auto": keyframe count above which loops are detected
+    vocab_tree: str | None = None      # vocabulary tree for loop detection; None = COLMAP's default
     camera_model: str = "SIMPLE_RADIAL"
     focal_factor: float = 0.8          # initial guess only; refined by bundle adjustment
     max_image_size: int = 1920
@@ -30,6 +37,7 @@ class SparseResult:
     num_models: int                    # >1 means the video broke into disconnected pieces
     num_points: int
     mean_reprojection_error: float
+    loop_detection: bool = False
 
 
 def reconstruct_sparse(
@@ -70,9 +78,18 @@ def reconstruct_sparse(
         reader_options=reader, extraction_options=extraction,
     )
 
+    loops = cfg.matcher == "sequential" and (
+        cfg.loops == "on" or (cfg.loops == "auto" and len(names) > cfg.loops_after)
+    )
     if cfg.matcher == "sequential":
         pairing = pycolmap.SequentialPairingOptions()
         pairing.overlap = cfg.overlap
+        if loops:
+            pairing.loop_detection = True
+            if cfg.vocab_tree:
+                pairing.vocab_tree_path = cfg.vocab_tree
+            if not pairing.vocab_tree_path:
+                raise RuntimeError("loop detection needs a vocabulary tree: pass one, or turn loops off")
         pycolmap.match_sequential(database, pairing_options=pairing)
     elif cfg.matcher == "exhaustive":
         pycolmap.match_exhaustive(database)
@@ -100,7 +117,7 @@ def reconstruct_sparse(
     best.export_PLY(output_dir / "sparse.ply")
     result = SparseResult(
         str(model_dir), len(names), best.num_reg_images(), len(models),
-        best.num_points3D(), float(best.compute_mean_reprojection_error()),
+        best.num_points3D(), float(best.compute_mean_reprojection_error()), loops,
     )
     (output_dir / "sparse.json").write_text(json.dumps(asdict(result) | {"config": asdict(cfg)}, indent=2))
     return result
