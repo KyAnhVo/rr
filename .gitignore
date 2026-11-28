@@ -20,12 +20,16 @@ wheels/
 *.tgz
 *:Zone.Identifier
 
-# Results: only the end products are tracked (pictures, meshes, metrics); intermediates stay
-# on disk but out of git, so a tracked run cannot be resumed, only re-run.
-results/**
-!results/**/
-!results/**/pictures/**
-!results/**/mesh/**
-!results/**/metrics.json
-!results/*/summary.csv
-!results/*/labels.csv
+# COLMAP binaries (depth/normal maps, sparse models, vocabulary trees): large and regenerable
+*.bin
+
+# Run outputs (results/ from rr-benchmark, out/ from make run): only pictures/ and mesh/ are
+# tracked. Everything else stays on disk but out of git, so a tracked run can be re-run, not resumed.
+/results/**
+/out/**
+!/results/**/
+!/out/**/
+!/results/**/pictures/**
+!/out/**/pictures/**
+!/results/**/mesh/**
+!/out/**/mesh/**

@@ -1,5 +1,6 @@
 """Imports pycolmap and reads COLMAP's dense arrays."""
 import ctypes
+import os
 import sysconfig
 from importlib import import_module
 from pathlib import Path
@@ -15,6 +16,14 @@ def load_pycolmap() -> Any:
     for name in ("libcudart.so.12", "libcurand.so.10"):
         for lib in nvidia.glob(f"*/lib/{name}"):
             ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+    # The wheel's bundled curl looks for CA certificates where Arch, Fedora and others do not
+    # keep them, so COLMAP's downloads (the vocabulary tree for loop detection) fail with SSL
+    # error 77 and abort the process. Point it at the system bundle unless the user has.
+    if "SSL_CERT_FILE" not in os.environ:
+        for bundle in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"):
+            if os.path.exists(bundle):
+                os.environ["SSL_CERT_FILE"] = bundle
+                break
     try:
         return import_module("pycolmap")
     except ModuleNotFoundError as e:

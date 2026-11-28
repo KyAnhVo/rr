@@ -101,6 +101,7 @@ run: envs weights check
 	$(AWAKE) uv run rr "$(VIDEO)" "$(OUTPUT)" --seg-model "$(SEG_MODEL)"
 	uv run python -m rr.mesh "$(OUTPUT)" --depth $(MESH_DEPTH)
 	@echo "pictures: $(OUTPUT)/pictures/   meshes: $(OUTPUT)/mesh/"
+
 # Environments only; downloaded data and results are kept.
 clean-envs:
 	rm -rf $(VENV) $(SEG_VENV)
